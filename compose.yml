@@ -1,9 +1,29 @@
-x-kong-config: &kong-env
-  KONG_DATABASE: ${KONG_DATABASE:-postgres}
-  KONG_PG_DATABASE: ${KONG_PG_DATABASE:-kong}
-  KONG_PG_HOST: db
-  KONG_PG_USER: ${KONG_PG_USER:-kong}
-  KONG_PG_PASSWORD_FILE: /run/secrets/kong_postgres_password
+x-kong-config: &kong-db-env
+  KONG_DATABASE: ${KONG_DATABASE}
+  KONG_PG_DATABASE: ${KONG_PG_DATABASE}
+  KONG_PG_HOST: ${KONG_PG_HOST}
+  KONG_PG_USER: ${KONG_PG_USER}
+  KONG_PG_PASSWORD: ${KONG_PG_PASSWORD}
+  
+x-konga-template: &konga-template
+  image: pantsel/konga:0.14.9
+  platform: linux/amd64
+  environment:
+    # HOST: konga.seduc.ce.gov.br
+    # DB_PG_SCHEMA: konga
+    DB_ADAPTER: ${KONGA_DB_ADAPTER}
+    DB_HOST: ${KONGA_DB_HOST}
+    DB_PORT: ${KONGA_DB_PORT}
+    DB_USER: ${KONGA_DB_USER}
+    DB_PASSWORD: ${KONGA_DB_PASSWORD}
+    DB_DATABASE: ${KONGA_DB_DATABASE}
+    TOKEN_SECRET: ${KONGA_TOKEN_SECRET}
+    NODE_ENV: ${KONGA_NODE_ENV}
+  networks:
+    - kong-net
+  restart: on-failure
+  security_opt:
+    - no-new-privileges
 
 volumes:
   kong_data: {}
@@ -16,124 +36,85 @@ networks:
 
 services:
   kong-migrations:
-    image: kong
+    image: kong:3.4.0
     command: kong migrations bootstrap
     profiles: ["database"]
     depends_on:
-      - db
+      - db-kong
     environment:
-      <<: *kong-env
-    secrets:
-      - kong_postgres_password
+      <<: *kong-db-env
     networks:
       - kong-net
     restart: on-failure
 
   kong-migrations-up:
-    image: kong
+    extends: kong-migrations
     command: kong migrations up && kong migrations finish
-    profiles: ["database"]
     depends_on:
-      - db
-    environment:
-      <<: *kong-env
-    secrets:
-      - kong_postgres_password
-    networks:
-      - kong-net
-    restart: on-failure
-
+      - db-kong
+    
   kong:
-    image: kong
-    user: "${KONG_USER:-kong}"
+    image: kong:3.4.0
+    user: kong
     environment:
-      <<: *kong-env
+      <<: *kong-db-env
       KONG_ADMIN_ACCESS_LOG: /dev/stdout
       KONG_ADMIN_ERROR_LOG: /dev/stderr
-      KONG_PROXY_LISTEN: "${KONG_PROXY_LISTEN:-0.0.0.0:8000}"
-      KONG_ADMIN_LISTEN: "${KONG_ADMIN_LISTEN:-0.0.0.0:8001}"
-      KONG_ADMIN_GUI_LISTEN: "${KONG_ADMIN_GUI_LISTEN:-0.0.0.0:8002}"
+      KONG_PROXY_LISTEN: 0.0.0.0:8000
+      KONG_ADMIN_LISTEN: 0.0.0.0:8001
+      KONG_ADMIN_GUI_LISTEN: 0.0.0.0:8002
       KONG_PROXY_ACCESS_LOG: /dev/stdout
       KONG_PROXY_ERROR_LOG: /dev/stderr
-      KONG_PREFIX: ${KONG_PREFIX:-/var/run/kong}
+      # KONG_PREFIX: /var/run/kong
       KONG_DECLARATIVE_CONFIG: "/opt/kong/kong.yaml"
-    secrets:
-      - kong_postgres_password
     networks:
       - kong-net
     ports:
-      # The following two environment variables default to an insecure value (0.0.0.0)
-      # according to the CIS Security test.
-      - "${KONG_INBOUND_PROXY_LISTEN:-0.0.0.0}:8000:8000/tcp"
-      - "${KONG_INBOUND_SSL_PROXY_LISTEN:-0.0.0.0}:8443:8443/tcp"
-      # Making them mandatory but undefined, like so would be backwards-breaking:
-      # - "${KONG_INBOUND_PROXY_LISTEN?Missing inbound proxy host}:8000:8000/tcp"
-      # - "${KONG_INBOUND_SSL_PROXY_LISTEN?Missing inbound proxy ssl host}:8443:8443/tcp"
-      # Alternative is deactivating check 5.13 in the security bench, if we consider Kong's own config to be enough security here
-
-      - "127.0.0.1:8001:8001/tcp"
-      - "127.0.0.1:8444:8444/tcp"
-      - "127.0.0.1:8002:8002/tcp"
+      - "8000:8000/tcp"
+      - "8443:8443/tcp"
+      - "8001:8001/tcp"
+      - "8444:8444/tcp"
+      - "8002:8002/tcp"
     healthcheck:
       test: ["CMD", "kong", "health"]
       interval: 10s
       timeout: 10s
       retries: 10
     restart: on-failure:5
-    read_only: true
+    # read_only: true
     volumes:
-      - kong_prefix_vol:${KONG_PREFIX:-/var/run/kong}
+      - kong_prefix_vol:/var/run/kong
       - kong_tmp_vol:/tmp
-      - ./config:/opt/kong
+      # - ./config:/opt/kong
     security_opt:
       - no-new-privileges
+    depends_on:
+      - db-kong
 
   konga:
-    image: pantsel/konga
-    platform: linux/amd64
+    <<: *konga-template
     depends_on:
       - kong
-    environment:
-      DB_ADAPTER: postgres
-      DB_HOST: db-konga
-      DB_PORT: 5432
-      DB_USER: konga
-      DB_PASSWORD: konga
-      DB_DATABASE: konga
-      TOKEN_SECRET: Fj!ZE5i$GVbdZa$WZEq^qUjSvDRKa48R
-      NODE_ENV: production
-    secrets:
-      - kong_postgres_password
-    networks:
-      - kong-net
     ports:
       - "1337:1337"
-    restart: on-failure
-
+    
   konga-prepare:
     container_name: konga-prepare
-    image: pantsel/konga
-    platform: linux/amd64
+    <<: *konga-template
     profiles: ["database"]
-    environment:
-      <<: *kong-env
-    command: "-c prepare -a postgres -u postgresql:konga:konga@db-konga:5432/konga"
-    networks:
-      - kong-net
+    command: "-c prepare -a postgres -u postgresql:${KONGA_DB_USER}:${KONGA_DB_PASSWORD}@${KONGA_DB_HOST}:${KONGA_DB_PORT}/${KONGA_DB_DATABASE}"
     depends_on:
-      - db
+      - db-konga
 
-  db:
+  db-kong:
     image: postgres:9.5
     profiles: ["database"]
     environment:
-      POSTGRES_DB: ${KONG_PG_DATABASE:-kong}
-      POSTGRES_USER: ${KONG_PG_USER:-kong}
-      POSTGRES_PASSWORD_FILE: /run/secrets/kong_postgres_password
-    secrets:
-      - kong_postgres_password
+      POSTGRES_DB: ${KONG_PG_DATABASE}
+      POSTGRES_USER: ${KONG_PG_USER}
+      POSTGRES_PASSWORD: ${KONG_PG_PASSWORD}
     healthcheck:
-      test: ["CMD", "pg_isready", "-U", "${KONG_PG_USER:-kong}"]
+      test: ["CMD", "pg_isready", "-U", "${KONG_PG_USER}"]
       interval: 30s
       timeout: 30s
       retries: 3
@@ -146,25 +127,13 @@ services:
       - kong_data:/var/lib/postgresql/data
 
   db-konga:
-    image: postgres:9.5
-    profiles: ["database"]
+    extends: db-kong
     environment:
-      POSTGRES_DB: konga
-      POSTGRES_USER: konga
-      POSTGRES_PASSWORD: konga
+      POSTGRES_DB: ${KONGA_DB_DATABASE}
+      POSTGRES_USER: ${KONGA_DB_USER}
+      POSTGRES_PASSWORD: ${KONGA_DB_PASSWORD}
     healthcheck:
-      test: ["CMD", "pg_isready", "-U", "konga"]
-      interval: 30s
-      timeout: 30s
-      retries: 3
-    restart: on-failure
-    # stdin_open: true
-    # tty: true
-    networks:
-      - kong-net
+      test: ["CMD", "pg_isready", "-U", "${KONGA_DB_USER}"]
     volumes:
       - konga_data:/var/lib/postgresql/data
-
-secrets:
-  kong_postgres_password:
-    file: ./POSTGRES_PASSWORD
+  
